@@ -110,7 +110,8 @@ pub fn canonical_type(raw: &str) -> String {
         .next()
         .unwrap_or(t.as_str());
     match base {
-        "serial" | "bigserial" | "smallserial" => "integer".to_owned(),
+        "serial" | "smallserial" => "integer".to_owned(),
+        "bigserial" => "bigint".to_owned(),
         "int" | "int4" | "integer" => "integer".to_owned(),
         "int2" | "smallint" => "smallint".to_owned(),
         "int8" | "bigint" => "bigint".to_owned(),
