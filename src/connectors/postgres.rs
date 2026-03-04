@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use super::{ColumnInfo, ConnectorKind, ForeignKeyInfo, IndexInfo, SchemaConnector, TableInfo};
+use super::{ColumnInfo, ConnectorKind, ConstraintInfo, ForeignKeyInfo, IndexInfo, SchemaConnector, TableInfo};
 
 pub struct PostgresConnector {
     pool: PgPool,
@@ -121,9 +121,48 @@ impl SchemaConnector for PostgresConnector {
         .fetch_all(&self.pool)
         .await?;
 
+        // UNIQUE constraints from information_schema
+        let unique_rows = sqlx::query(
+            r#"
+            SELECT
+                tc.table_name,
+                tc.constraint_name,
+                ARRAY_AGG(kcu.column_name::text ORDER BY kcu.ordinal_position) AS columns
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+                ON tc.constraint_name = kcu.constraint_name
+                AND tc.table_schema = kcu.table_schema
+            WHERE tc.table_schema = 'public'
+              AND tc.constraint_type = 'UNIQUE'
+            GROUP BY tc.table_name, tc.constraint_name
+            ORDER BY tc.table_name, tc.constraint_name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        // CHECK constraints from pg_constraint (information_schema does not expose expression)
+        let check_rows = sqlx::query(
+            r#"
+            SELECT
+                t.relname AS table_name,
+                c.conname AS constraint_name,
+                pg_get_constraintdef(c.oid) AS expression
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE c.contype = 'c'
+              AND n.nspname = 'public'
+            ORDER BY t.relname, c.conname
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
         let mut by_table_columns: BTreeMap<String, Vec<ColumnInfo>> = BTreeMap::new();
         let mut by_table_indexes: BTreeMap<String, Vec<IndexInfo>> = BTreeMap::new();
         let mut by_table_fks: BTreeMap<String, Vec<ForeignKeyInfo>> = BTreeMap::new();
+        let mut by_table_constraints: BTreeMap<String, Vec<ConstraintInfo>> = BTreeMap::new();
 
         for row in column_rows {
             let table_name: String = row.try_get("table_name")?;
@@ -157,6 +196,28 @@ impl SchemaConnector for PostgresConnector {
             by_table_fks.entry(table_name).or_default().push(fk);
         }
 
+        for row in unique_rows {
+            let table_name: String = row.try_get("table_name")?;
+            let c = ConstraintInfo {
+                name: row.try_get("constraint_name")?,
+                kind: "unique".to_owned(),
+                columns: row.try_get("columns")?,
+                expression: None,
+            };
+            by_table_constraints.entry(table_name).or_default().push(c);
+        }
+
+        for row in check_rows {
+            let table_name: String = row.try_get("table_name")?;
+            let c = ConstraintInfo {
+                name: row.try_get("constraint_name")?,
+                kind: "check".to_owned(),
+                columns: vec![],
+                expression: Some(row.try_get("expression")?),
+            };
+            by_table_constraints.entry(table_name).or_default().push(c);
+        }
+
         let tables = by_table_columns
             .into_iter()
             .map(|(name, mut columns)| {
@@ -165,11 +226,14 @@ impl SchemaConnector for PostgresConnector {
                 indexes.sort_by(|a, b| a.name.cmp(&b.name));
                 let mut foreign_keys = by_table_fks.remove(&name).unwrap_or_default();
                 foreign_keys.sort_by(|a, b| a.name.cmp(&b.name));
+                let mut constraints = by_table_constraints.remove(&name).unwrap_or_default();
+                constraints.sort_by(|a, b| a.name.cmp(&b.name));
                 TableInfo {
                     name,
                     columns,
                     indexes,
                     foreign_keys,
+                    constraints,
                 }
             })
             .collect();

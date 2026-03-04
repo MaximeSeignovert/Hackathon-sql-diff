@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
 
-use super::{ColumnInfo, ConnectorKind, ForeignKeyInfo, IndexInfo, SchemaConnector, TableInfo};
+use super::{ColumnInfo, ConnectorKind, ConstraintInfo, ForeignKeyInfo, IndexInfo, SchemaConnector, TableInfo};
 
 pub struct SqliteConnector {
     pool: SqlitePool,
@@ -75,12 +75,14 @@ impl SchemaConnector for SqliteConnector {
 
             let indexes = load_indexes(&self.pool, &table_name).await?;
             let foreign_keys = load_foreign_keys(&self.pool, &table_name).await?;
+            let constraints = load_constraints(&self.pool, &table_name).await?;
 
             schema.push(TableInfo {
                 name: table_name,
                 columns,
                 indexes,
                 foreign_keys,
+                constraints,
             });
         }
 
@@ -119,6 +121,125 @@ async fn load_indexes(pool: &SqlitePool, table_name: &str) -> Result<Vec<IndexIn
 
     indexes.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(indexes)
+}
+
+/// Extrait les contraintes UNIQUE et CHECK depuis sqlite_master en parsant le DDL.
+async fn load_constraints(pool: &SqlitePool, table_name: &str) -> Result<Vec<ConstraintInfo>> {
+    let escaped = table_name.replace('\'', "''");
+    let row = sqlx::query(&format!(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{}'",
+        escaped
+    ))
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(vec![]);
+    };
+    let ddl: Option<String> = row.try_get("sql")?;
+    let Some(ddl) = ddl else {
+        return Ok(vec![]);
+    };
+
+    Ok(parse_sqlite_constraints(&ddl, table_name))
+}
+
+/// Parse les contraintes UNIQUE et CHECK inline d'un DDL SQLite CREATE TABLE.
+fn parse_sqlite_constraints(ddl: &str, table_name: &str) -> Vec<ConstraintInfo> {
+    let open = match ddl.find('(') {
+        Some(i) => i,
+        None => return vec![],
+    };
+    let close = match ddl.rfind(')') {
+        Some(i) => i,
+        None => return vec![],
+    };
+    let body = &ddl[open + 1..close];
+    let mut constraints = Vec::new();
+    let mut auto_idx = 0usize;
+
+    for part in split_top_level_comma(body) {
+        let item = part.trim();
+        let lowered = item.to_lowercase();
+
+        let (name, rest) = if lowered.starts_with("constraint") {
+            let tokens: Vec<&str> = item.splitn(3, char::is_whitespace).collect();
+            let n = tokens.get(1).map(|s| s.trim_matches('"').trim_matches('`').to_lowercase()).unwrap_or_default();
+            let r = tokens.get(2).copied().unwrap_or("");
+            (n, r)
+        } else {
+            auto_idx += 1;
+            (format!("auto_{}_{}_{}", table_name, if lowered.contains("unique") { "uq" } else { "ck" }, auto_idx), item)
+        };
+
+        let rest_lower = rest.to_lowercase();
+        if rest_lower.trim_start().starts_with("unique") {
+            if let Some(cols) = extract_cols_from_parens(rest) {
+                constraints.push(ConstraintInfo {
+                    name,
+                    kind: "unique".to_owned(),
+                    columns: cols,
+                    expression: None,
+                });
+            }
+        } else if rest_lower.trim_start().starts_with("check") {
+            if let Some(expr) = extract_check_expression(rest) {
+                constraints.push(ConstraintInfo {
+                    name,
+                    kind: "check".to_owned(),
+                    columns: vec![],
+                    expression: Some(expr),
+                });
+            }
+        }
+    }
+
+    constraints
+}
+
+fn split_top_level_comma(input: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    for ch in input.chars() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '(' if !in_single && !in_double => depth += 1,
+            ')' if !in_single && !in_double && depth > 0 => depth -= 1,
+            _ => {}
+        }
+        if ch == ',' && depth == 0 && !in_single && !in_double {
+            parts.push(current.trim().to_owned());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_owned());
+    }
+    parts
+}
+
+fn extract_cols_from_parens(s: &str) -> Option<Vec<String>> {
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    let inner = &s[open + 1..close];
+    let cols = inner
+        .split(',')
+        .map(|c| c.trim().trim_matches('"').trim_matches('`').to_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    Some(cols)
+}
+
+fn extract_check_expression(s: &str) -> Option<String> {
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    Some(s[open + 1..close].trim().to_owned())
 }
 
 async fn load_foreign_keys(pool: &SqlitePool, table_name: &str) -> Result<Vec<ForeignKeyInfo>> {

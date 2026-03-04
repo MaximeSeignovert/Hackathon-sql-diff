@@ -28,6 +28,19 @@ pub struct TableInfo {
     pub columns: Vec<ColumnInfo>,
     pub indexes: Vec<IndexInfo>,
     pub foreign_keys: Vec<ForeignKeyInfo>,
+    pub constraints: Vec<ConstraintInfo>,
+}
+
+/// Contrainte de table lue depuis le SGBD (UNIQUE ou CHECK).
+#[derive(Debug, Clone)]
+pub struct ConstraintInfo {
+    pub name: String,
+    /// "unique" ou "check"
+    pub kind: String,
+    /// Colonnes impliquees (pour UNIQUE)
+    pub columns: Vec<String>,
+    /// Expression (pour CHECK)
+    pub expression: Option<String>,
 }
 
 #[derive(Debug, Clone)]

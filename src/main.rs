@@ -7,7 +7,7 @@ use hackathon_diff_sql::diff_engine::diff_schema;
 use hackathon_diff_sql::reporter::{render_diff_html, render_diff_markdown};
 use hackathon_diff_sql::schema_model::SchemaModel;
 use hackathon_diff_sql::sql_dump_parser::parse_schema_from_sql;
-use hackathon_diff_sql::sql_generator::{generate_migration_sql, SqlDialect};
+use hackathon_diff_sql::sql_generator::{generate_migration_sql, generate_rollback_sql, SqlDialect};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Schema diff tooling bootstrap (Rust)")]
@@ -46,14 +46,27 @@ enum Commands {
         target_url: Option<String>,
         #[arg(long = "target-sql")]
         target_sql: Option<String>,
+        /// Dialecte SQL cible pour la generation du script (postgres ou sqlite).
+        /// Utilise quand --target-connector n'est pas specifie (ex: --target-sql).
+        /// Par defaut: postgres.
+        #[arg(long, value_enum, default_value = "postgres")]
+        dialect: SqlDialect,
         #[arg(long, default_value = "migration.sql")]
         out_sql: String,
         #[arg(long, default_value = "diff_report.md")]
         out_report: String,
         #[arg(long, default_value = "diff_report.html")]
         out_html: String,
+        /// Affiche les changements sans ecrire les fichiers de sortie.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// Autorise la generation du script meme si des operations destructives sont detectees.
+        /// Sans ce flag, le script n'est pas ecrit si des destructions sont detectees.
+        #[arg(long, default_value_t = false)]
+        allow_destructive: bool,
+        /// Fichier de sortie pour le script de rollback (migration inverse).
+        #[arg(long)]
+        out_rollback: Option<String>,
     },
 }
 
@@ -112,10 +125,13 @@ async fn main() -> Result<()> {
             target_connector,
             target_url,
             target_sql,
+            dialect,
             out_sql,
             out_report,
             out_html,
             dry_run,
+            allow_destructive,
+            out_rollback,
         } => {
             let source_schema =
                 load_schema_model(source_connector, source_url, source_sql, "source").await?;
@@ -125,36 +141,60 @@ async fn main() -> Result<()> {
             let diff = diff_schema(&source_schema, &target_schema);
             let report = render_diff_markdown(&diff);
             let report_html = render_diff_html(&diff);
-            let dialect = target_connector
+
+            // Le dialecte vient du connecteur cible si present, sinon de --dialect
+            let effective_dialect = target_connector
                 .map(SqlDialect::from)
-                .unwrap_or(SqlDialect::Postgres);
-            let sql = generate_migration_sql(&source_schema, &target_schema, &diff, dialect);
+                .unwrap_or(dialect);
+
+            let sql = generate_migration_sql(&source_schema, &target_schema, &diff, effective_dialect);
+            let rollback_sql = generate_rollback_sql(&source_schema, &target_schema, &diff, effective_dialect);
 
             println!("{}", report);
             println!();
             println!("--- SQL ---");
             println!("{}", sql);
 
+            if !diff.has_changes() {
+                println!("Aucun changement detecte.");
+            }
+
+            if !diff.destructive_warnings.is_empty() {
+                eprintln!();
+                eprintln!("ATTENTION: {} operation(s) destructive(s) detectee(s):", diff.destructive_warnings.len());
+                for w in &diff.destructive_warnings {
+                    eprintln!("  - {}", w);
+                }
+                if !allow_destructive {
+                    eprintln!();
+                    eprintln!("Les fichiers de sortie ne seront PAS ecrits.");
+                    eprintln!("Utilisez --allow-destructive pour forcer la generation malgre les risques.");
+                    return Ok(());
+                }
+                eprintln!("Flag --allow-destructive actif: les fichiers seront ecrits malgre les risques.");
+            }
+
             if !dry_run {
-                std::fs::write(&out_report, report)
+                std::fs::write(&out_report, &report)
                     .with_context(|| format!("Impossible d'ecrire {}", out_report))?;
-                std::fs::write(&out_sql, sql)
+                std::fs::write(&out_sql, &sql)
                     .with_context(|| format!("Impossible d'ecrire {}", out_sql))?;
-                std::fs::write(&out_html, report_html)
+                std::fs::write(&out_html, &report_html)
                     .with_context(|| format!("Impossible d'ecrire {}", out_html))?;
                 println!(
                     "Fichiers generes: rapport_md={} rapport_html={} script={}",
                     out_report, out_html, out_sql
                 );
+                if let Some(ref rollback_path) = out_rollback {
+                    std::fs::write(rollback_path, &rollback_sql)
+                        .with_context(|| format!("Impossible d'ecrire {}", rollback_path))?;
+                    println!("Script de rollback genere: {}", rollback_path);
+                }
             } else {
+                println!();
+                println!("--- ROLLBACK SQL ---");
+                println!("{}", rollback_sql);
                 println!("Mode dry-run: aucun fichier ecrit.");
-            }
-
-            if !diff.has_changes() {
-                println!("Aucun changement detecte.");
-            }
-            if !diff.destructive_warnings.is_empty() {
-                println!("ATTENTION: operations destructives detectees.");
             }
         }
     }
