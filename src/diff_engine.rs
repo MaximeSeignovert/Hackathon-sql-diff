@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::schema_model::{Column, ForeignKey, Index, SchemaModel};
+use crate::schema_model::{Column, Constraint, ForeignKey, Index, SchemaModel};
 
 #[derive(Debug, Clone)]
 pub struct DiffResult {
@@ -16,12 +16,17 @@ pub struct TableDiff {
     pub added_columns: Vec<Column>,
     pub removed_columns: Vec<Column>,
     pub modified_columns: Vec<ColumnModification>,
+    /// Colonnes detectees comme renommees (meme type, meme not_null, nom different).
+    pub renamed_columns: Vec<ColumnRename>,
     pub added_indexes: Vec<Index>,
     pub removed_indexes: Vec<Index>,
     pub modified_indexes: Vec<IndexModification>,
     pub added_foreign_keys: Vec<ForeignKey>,
     pub removed_foreign_keys: Vec<ForeignKey>,
     pub modified_foreign_keys: Vec<ForeignKeyModification>,
+    pub added_constraints: Vec<(String, Constraint)>,
+    pub removed_constraints: Vec<(String, Constraint)>,
+    pub modified_constraints: Vec<ConstraintModification>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +35,16 @@ pub struct ColumnModification {
     pub new: Column,
     pub destructive: bool,
     pub reason: Option<String>,
+}
+
+/// Renommage detecte par heuristique : colonne source absente de cible + colonne cible absente de source
+/// avec meme type canonique et meme contrainte NOT NULL. Si le match est ambigu (plusieurs candidats
+/// de meme type), aucun renommage n'est declare (les colonnes restent dans added/removed).
+#[derive(Debug, Clone)]
+pub struct ColumnRename {
+    pub old_name: String,
+    pub new_name: String,
+    pub data_type: String,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +57,13 @@ pub struct IndexModification {
 pub struct ForeignKeyModification {
     pub old: ForeignKey,
     pub new: ForeignKey,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstraintModification {
+    pub name: String,
+    pub old: Constraint,
+    pub new: Constraint,
 }
 
 impl DiffResult {
@@ -87,15 +109,23 @@ pub fn diff_schema(source: &SchemaModel, target: &SchemaModel) -> DiffResult {
         let target_indexes: BTreeSet<String> = target_table.indexes.keys().cloned().collect();
         let source_fks: BTreeSet<String> = source_table.foreign_keys.keys().cloned().collect();
         let target_fks: BTreeSet<String> = target_table.foreign_keys.keys().cloned().collect();
+        let source_constraints: BTreeSet<String> = source_table.constraints.keys().cloned().collect();
+        let target_constraints: BTreeSet<String> = target_table.constraints.keys().cloned().collect();
 
-        let mut added_columns = target_cols
+        let raw_added_columns = target_cols
             .difference(&source_cols)
             .filter_map(|name| target_table.columns.get(name).cloned())
             .collect::<Vec<_>>();
-        let mut removed_columns = source_cols
+        let raw_removed_columns = source_cols
             .difference(&target_cols)
             .filter_map(|name| source_table.columns.get(name).cloned())
             .collect::<Vec<_>>();
+
+        // Heuristique de renommage: si une colonne supprimee et une colonne ajoutee ont exactement
+        // le meme type canonique et le meme not_null, et qu'elles sont les seules candidates de ce type
+        // dans l'ensemble removed/added, on considere qu'il s'agit d'un renommage.
+        let (mut added_columns, mut removed_columns, mut renamed_columns) =
+            detect_renames(raw_added_columns, raw_removed_columns);
 
         let mut modified_columns = Vec::new();
         let mut added_indexes = target_indexes
@@ -117,6 +147,21 @@ pub fn diff_schema(source: &SchemaModel, target: &SchemaModel) -> DiffResult {
             .filter_map(|name| source_table.foreign_keys.get(name).cloned())
             .collect::<Vec<_>>();
         let mut modified_foreign_keys = Vec::new();
+
+        let mut added_constraints = target_constraints
+            .difference(&source_constraints)
+            .filter_map(|name| {
+                target_table.constraints.get(name).cloned().map(|c| (name.clone(), c))
+            })
+            .collect::<Vec<_>>();
+        let mut removed_constraints = source_constraints
+            .difference(&target_constraints)
+            .filter_map(|name| {
+                source_table.constraints.get(name).cloned().map(|c| (name.clone(), c))
+            })
+            .collect::<Vec<_>>();
+        let mut modified_constraints = Vec::new();
+
         for col_name in source_cols.intersection(&target_cols) {
             let old_col = source_table.columns.get(col_name).cloned();
             let new_col = target_table.columns.get(col_name).cloned();
@@ -173,8 +218,22 @@ pub fn diff_schema(source: &SchemaModel, target: &SchemaModel) -> DiffResult {
             }
         }
 
+        for c_name in source_constraints.intersection(&target_constraints) {
+            let old_c = source_table.constraints.get(c_name).cloned();
+            let new_c = target_table.constraints.get(c_name).cloned();
+            let (Some(old_c), Some(new_c)) = (old_c, new_c) else { continue };
+            if old_c != new_c {
+                modified_constraints.push(ConstraintModification {
+                    name: c_name.clone(),
+                    old: old_c,
+                    new: new_c,
+                });
+            }
+        }
+
         added_columns.sort_by(|a, b| a.name.cmp(&b.name));
         removed_columns.sort_by(|a, b| a.name.cmp(&b.name));
+        renamed_columns.sort_by(|a, b| a.old_name.cmp(&b.old_name));
         modified_columns.sort_by(|a, b| a.old.name.cmp(&b.old.name));
         added_indexes.sort_by(|a, b| a.name.cmp(&b.name));
         removed_indexes.sort_by(|a, b| a.name.cmp(&b.name));
@@ -182,9 +241,13 @@ pub fn diff_schema(source: &SchemaModel, target: &SchemaModel) -> DiffResult {
         added_foreign_keys.sort_by(|a, b| a.name.cmp(&b.name));
         removed_foreign_keys.sort_by(|a, b| a.name.cmp(&b.name));
         modified_foreign_keys.sort_by(|a, b| a.old.name.cmp(&b.old.name));
+        added_constraints.sort_by(|a, b| a.0.cmp(&b.0));
+        removed_constraints.sort_by(|a, b| a.0.cmp(&b.0));
+        modified_constraints.sort_by(|a, b| a.name.cmp(&b.name));
 
         if !added_columns.is_empty()
             || !removed_columns.is_empty()
+            || !renamed_columns.is_empty()
             || !modified_columns.is_empty()
             || !added_indexes.is_empty()
             || !removed_indexes.is_empty()
@@ -192,6 +255,9 @@ pub fn diff_schema(source: &SchemaModel, target: &SchemaModel) -> DiffResult {
             || !added_foreign_keys.is_empty()
             || !removed_foreign_keys.is_empty()
             || !modified_foreign_keys.is_empty()
+            || !added_constraints.is_empty()
+            || !removed_constraints.is_empty()
+            || !modified_constraints.is_empty()
         {
             for removed in &removed_columns {
                 destructive_warnings.push(format!(
@@ -211,18 +277,28 @@ pub fn diff_schema(source: &SchemaModel, target: &SchemaModel) -> DiffResult {
                     table_name, modified.old.name
                 ));
             }
+            for removed in &removed_constraints {
+                destructive_warnings.push(format!(
+                    "Suppression de contrainte detectee: {}.{}",
+                    table_name, removed.0
+                ));
+            }
 
             altered_tables.push(TableDiff {
                 table_name,
                 added_columns,
                 removed_columns,
                 modified_columns,
+                renamed_columns,
                 added_indexes,
                 removed_indexes,
                 modified_indexes,
                 added_foreign_keys,
                 removed_foreign_keys,
                 modified_foreign_keys,
+                added_constraints,
+                removed_constraints,
+                modified_constraints,
             });
         }
     }
@@ -252,6 +328,73 @@ fn detect_destructive_change(old: &Column, new: &Column) -> (bool, Option<String
     }
 
     (false, None)
+}
+
+/// Detecte les renommages de colonnes par heuristique.
+/// Regle: si une seule colonne supprimee et une seule colonne ajoutee ont exactement
+/// le meme type canonique et le meme not_null, elles forment une paire de renommage.
+/// Si plusieurs candidats de meme signature existent (ambigu), on ne declare aucun renommage.
+/// Retourne (added_restants, removed_restants, renames_detectes).
+fn detect_renames(
+    added: Vec<Column>,
+    removed: Vec<Column>,
+) -> (Vec<Column>, Vec<Column>, Vec<ColumnRename>) {
+    let mut renames = Vec::new();
+    let mut used_added: Vec<bool> = vec![false; added.len()];
+    let mut used_removed: Vec<bool> = vec![false; removed.len()];
+
+    for (ri, rem) in removed.iter().enumerate() {
+        // Chercher les colonnes ajoutees compatibles (meme type, meme not_null)
+        let candidates: Vec<usize> = added
+            .iter()
+            .enumerate()
+            .filter(|(ai, a)| {
+                !used_added[*ai]
+                    && a.data_type == rem.data_type
+                    && a.not_null == rem.not_null
+            })
+            .map(|(ai, _)| ai)
+            .collect();
+
+        if candidates.len() == 1 {
+            let ai = candidates[0];
+            // Verifier unicite du cote removed aussi
+            let other_removed_count = removed
+                .iter()
+                .enumerate()
+                .filter(|(other_ri, r)| {
+                    *other_ri != ri
+                        && !used_removed[*other_ri]
+                        && r.data_type == rem.data_type
+                        && r.not_null == rem.not_null
+                })
+                .count();
+            if other_removed_count == 0 {
+                used_added[ai] = true;
+                used_removed[ri] = true;
+                renames.push(ColumnRename {
+                    old_name: rem.name.clone(),
+                    new_name: added[ai].name.clone(),
+                    data_type: rem.data_type.clone(),
+                });
+            }
+        }
+    }
+
+    let remaining_added = added
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !used_added[*i])
+        .map(|(_, c)| c)
+        .collect();
+    let remaining_removed = removed
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !used_removed[*i])
+        .map(|(_, c)| c)
+        .collect();
+
+    (remaining_added, remaining_removed, renames)
 }
 
 /// Returns (destructive, reason). Safe widening (e.g. integer->bigint) is not destructive.
@@ -295,6 +438,7 @@ mod tests {
             columns,
             indexes: BTreeMap::new(),
             foreign_keys: BTreeMap::new(),
+            constraints: BTreeMap::new(),
         }
     }
 
@@ -376,5 +520,141 @@ mod tests {
             .iter()
             .any(|w| w.contains("created_at") && w.contains("destructive"));
         assert!(has_destructive, "timestamp->text should be destructive");
+    }
+
+    #[test]
+    fn column_rename_detected_by_heuristic() {
+        // Meme type + meme not_null => renommage detecte
+        let source = SchemaModel {
+            tables: [(
+                "t".to_string(),
+                table_with_columns(vec![("full_name", "text", false)]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let target = SchemaModel {
+            tables: [(
+                "t".to_string(),
+                table_with_columns(vec![("display_name", "text", false)]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let diff = diff_schema(&source, &target);
+        assert!(diff.has_changes());
+        let td = &diff.altered_tables[0];
+        assert_eq!(td.renamed_columns.len(), 1, "Should detect 1 rename");
+        assert_eq!(td.renamed_columns[0].old_name, "full_name");
+        assert_eq!(td.renamed_columns[0].new_name, "display_name");
+        assert!(td.added_columns.is_empty(), "Renamed col should not appear as added");
+        assert!(td.removed_columns.is_empty(), "Renamed col should not appear as removed");
+    }
+
+    #[test]
+    fn ambiguous_renames_not_detected() {
+        // Deux colonnes de meme type supprimees/ajoutees => ambigu, pas de renommage
+        let source = SchemaModel {
+            tables: [(
+                "t".to_string(),
+                table_with_columns(vec![("col_a", "integer", false), ("col_b", "integer", false)]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let target = SchemaModel {
+            tables: [(
+                "t".to_string(),
+                table_with_columns(vec![("col_x", "integer", false), ("col_y", "integer", false)]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let diff = diff_schema(&source, &target);
+        assert!(diff.has_changes());
+        let td = &diff.altered_tables[0];
+        assert_eq!(td.renamed_columns.len(), 0, "Ambiguous case should not produce renames");
+        assert_eq!(td.added_columns.len(), 2);
+        assert_eq!(td.removed_columns.len(), 2);
+    }
+
+    #[test]
+    fn no_changes_produces_empty_diff() {
+        let source = SchemaModel {
+            tables: [("t".to_string(), table_with_columns(vec![("id", "integer", true)]))]
+                .into_iter()
+                .collect(),
+        };
+        let diff = diff_schema(&source, &source);
+        assert!(!diff.has_changes());
+        assert!(diff.destructive_warnings.is_empty());
+        assert!(diff.altered_tables.is_empty());
+    }
+
+    #[test]
+    fn table_drop_is_destructive() {
+        let source = SchemaModel {
+            tables: [("old_table".to_string(), table_with_columns(vec![("id", "integer", true)]))]
+                .into_iter()
+                .collect(),
+        };
+        let target = SchemaModel {
+            tables: std::collections::BTreeMap::new(),
+        };
+        let diff = diff_schema(&source, &target);
+        assert!(diff.has_changes());
+        assert!(!diff.removed_tables.is_empty());
+        let has_drop_warning = diff.destructive_warnings.iter().any(|w| w.contains("old_table"));
+        assert!(has_drop_warning, "Table drop should emit a destructive warning");
+    }
+
+    #[test]
+    fn column_drop_is_destructive() {
+        let source = SchemaModel {
+            tables: [(
+                "t".to_string(),
+                table_with_columns(vec![("id", "integer", true), ("to_drop", "text", false)]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let target = SchemaModel {
+            tables: [(
+                "t".to_string(),
+                table_with_columns(vec![("id", "integer", true)]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let diff = diff_schema(&source, &target);
+        assert!(diff.has_changes());
+        let has_warning = diff.destructive_warnings.iter().any(|w| w.contains("to_drop"));
+        assert!(has_warning, "Column drop should emit a destructive warning");
+    }
+
+    #[test]
+    fn unique_constraint_diff_detected() {
+        use crate::schema_model::Constraint;
+        let mut source_table = table_with_columns(vec![("email", "text", true)]);
+        source_table.constraints.insert(
+            "uq_email".to_owned(),
+            Constraint::Unique { columns: vec!["email".to_owned()] },
+        );
+        let target_table = table_with_columns(vec![("email", "text", true)]);
+        // target has no constraint => removed
+
+        let source = SchemaModel {
+            tables: [("t".to_string(), source_table)].into_iter().collect(),
+        };
+        let target = SchemaModel {
+            tables: [("t".to_string(), target_table)].into_iter().collect(),
+        };
+        let diff = diff_schema(&source, &target);
+        assert!(diff.has_changes());
+        let td = &diff.altered_tables[0];
+        assert_eq!(td.removed_constraints.len(), 1);
+        assert_eq!(td.added_constraints.len(), 0);
+        let has_warning = diff.destructive_warnings.iter().any(|w| w.contains("uq_email"));
+        assert!(has_warning, "Removed constraint should produce a destructive warning");
     }
 }

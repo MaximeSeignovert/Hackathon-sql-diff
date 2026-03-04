@@ -13,6 +13,15 @@ pub struct Table {
     pub columns: BTreeMap<String, Column>,
     pub indexes: BTreeMap<String, Index>,
     pub foreign_keys: BTreeMap<String, ForeignKey>,
+    pub constraints: BTreeMap<String, Constraint>,
+}
+
+/// Contrainte de table au niveau du modele canonique.
+/// UNIQUE et CHECK sont supportes; les PRIMARY KEY sont omises (gerees via Index).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Constraint {
+    Unique { columns: Vec<String> },
+    Check { expression: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +55,7 @@ impl SchemaModel {
             let mut columns = BTreeMap::new();
             let mut indexes = BTreeMap::new();
             let mut foreign_keys = BTreeMap::new();
+            let mut constraints = BTreeMap::new();
             for col in table.columns {
                 let column = Column {
                     name: col.name.clone(),
@@ -84,11 +94,24 @@ impl SchemaModel {
                 };
                 foreign_keys.insert(fk.name, key);
             }
+            for c in table.constraints {
+                let constraint = match c.kind.as_str() {
+                    "unique" => Constraint::Unique {
+                        columns: c.columns.into_iter().map(|col| normalize_identifier(&col)).collect(),
+                    },
+                    "check" => Constraint::Check {
+                        expression: c.expression.unwrap_or_default(),
+                    },
+                    _ => continue,
+                };
+                constraints.insert(c.name, constraint);
+            }
             let model_table = Table {
                 name: table.name.clone(),
                 columns,
                 indexes,
                 foreign_keys,
+                constraints,
             };
             by_name.insert(table.name, model_table);
         }

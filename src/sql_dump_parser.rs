@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 
-use crate::schema_model::{Column, ForeignKey, Index, SchemaModel, Table};
+use crate::schema_model::{Column, Constraint, ForeignKey, Index, SchemaModel, Table};
 
 pub fn parse_schema_from_sql(sql: &str) -> Result<SchemaModel> {
     let mut tables: BTreeMap<String, Table> = BTreeMap::new();
@@ -59,6 +59,9 @@ fn parse_create_table(statement: &str) -> Option<(String, Table)> {
 
     let mut columns = BTreeMap::new();
     let mut foreign_keys = BTreeMap::new();
+    let mut constraints = BTreeMap::new();
+    let mut auto_constraint_idx = 0usize;
+
     for part in split_top_level(body, ',') {
         let item = part.trim();
         if item.is_empty() {
@@ -69,6 +72,11 @@ fn parse_create_table(statement: &str) -> Option<(String, Table)> {
             if let Some(fk) = parse_inline_fk(item, &table_name) {
                 foreign_keys.insert(fk.name.clone(), fk);
             }
+            continue;
+        }
+        // Table-level UNIQUE or CHECK (possibly with CONSTRAINT name)
+        if let Some(constraint) = parse_table_constraint(item, &table_name, &mut auto_constraint_idx) {
+            constraints.insert(constraint.0.clone(), constraint.1);
             continue;
         }
         if let Some(column) = parse_column_def(item) {
@@ -83,8 +91,63 @@ fn parse_create_table(statement: &str) -> Option<(String, Table)> {
             columns,
             indexes: BTreeMap::new(),
             foreign_keys,
+            constraints,
         },
     ))
+}
+
+/// Tente de parser une contrainte de table (UNIQUE ou CHECK), avec ou sans nom CONSTRAINT.
+fn parse_table_constraint(item: &str, table_name: &str, auto_idx: &mut usize) -> Option<(String, Constraint)> {
+    let lowered = item.to_lowercase();
+
+    let (name, rest) = if lowered.trim_start().starts_with("constraint") {
+        let tokens: Vec<&str> = item.splitn(3, char::is_whitespace).collect();
+        let n = normalize_identifier_token(tokens.get(1)?)
+            .unwrap_or_else(|| format!("auto_{}_{}", table_name, *auto_idx));
+        let r = tokens.get(2).copied().unwrap_or("");
+        (n, r.to_owned())
+    } else {
+        (String::new(), item.to_owned())
+    };
+
+    let rest_lower = rest.trim().to_lowercase();
+
+    if rest_lower.starts_with("unique") {
+        *auto_idx += 1;
+        let constraint_name = if name.is_empty() {
+            format!("uq_{}_{}", table_name, auto_idx)
+        } else {
+            name
+        };
+        let cols = extract_paren_cols(&rest)?;
+        return Some((constraint_name, Constraint::Unique { columns: cols }));
+    }
+
+    if rest_lower.starts_with("check") {
+        *auto_idx += 1;
+        let constraint_name = if name.is_empty() {
+            format!("ck_{}_{}", table_name, auto_idx)
+        } else {
+            name
+        };
+        let open = rest.find('(')?;
+        let close = rest.rfind(')')?;
+        let expr = rest[open + 1..close].trim().to_owned();
+        return Some((constraint_name, Constraint::Check { expression: expr }));
+    }
+
+    None
+}
+
+fn extract_paren_cols(s: &str) -> Option<Vec<String>> {
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    let inner = &s[open + 1..close];
+    let cols = inner
+        .split(',')
+        .filter_map(|c| normalize_identifier_token(c.trim()))
+        .collect();
+    Some(cols)
 }
 
 fn parse_create_index(statement: &str) -> Option<(String, Index)> {
@@ -251,6 +314,7 @@ fn empty_table(name: &str) -> Table {
         columns: BTreeMap::new(),
         indexes: BTreeMap::new(),
         foreign_keys: BTreeMap::new(),
+        constraints: BTreeMap::new(),
     }
 }
 
@@ -338,5 +402,103 @@ mod tests {
         let fk = orders.foreign_keys.values().next().unwrap();
         assert_eq!(fk.referenced_table, "users");
         assert_eq!(fk.referenced_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn unique_constraint_inline_parsed() {
+        let sql = r#"
+            CREATE TABLE products (
+              id integer NOT NULL,
+              sku text NOT NULL,
+              CONSTRAINT uq_products_sku UNIQUE (sku)
+            );
+        "#;
+        let model = parse_schema_from_sql(sql).unwrap();
+        let products = &model.tables["products"];
+        assert_eq!(products.constraints.len(), 1, "Should have 1 UNIQUE constraint");
+        let (name, constraint) = products.constraints.iter().next().unwrap();
+        assert_eq!(name, "uq_products_sku");
+        match constraint {
+            crate::schema_model::Constraint::Unique { columns } => {
+                assert_eq!(columns, &vec!["sku".to_owned()]);
+            }
+            _ => panic!("Expected Unique constraint"),
+        }
+    }
+
+    #[test]
+    fn check_constraint_inline_parsed() {
+        let sql = r#"
+            CREATE TABLE accounts (
+              id integer NOT NULL,
+              balance numeric NOT NULL,
+              CONSTRAINT ck_balance_positive CHECK (balance >= 0)
+            );
+        "#;
+        let model = parse_schema_from_sql(sql).unwrap();
+        let accounts = &model.tables["accounts"];
+        assert_eq!(accounts.constraints.len(), 1, "Should have 1 CHECK constraint");
+        let (name, constraint) = accounts.constraints.iter().next().unwrap();
+        assert_eq!(name, "ck_balance_positive");
+        match constraint {
+            crate::schema_model::Constraint::Check { expression } => {
+                assert!(expression.contains("balance"), "Expression should reference balance column");
+            }
+            _ => panic!("Expected Check constraint"),
+        }
+    }
+
+    #[test]
+    fn unique_constraint_without_name_parsed() {
+        let sql = "CREATE TABLE t ( a integer, b text, UNIQUE (a, b) );";
+        let model = parse_schema_from_sql(sql).unwrap();
+        let t = &model.tables["t"];
+        assert_eq!(t.constraints.len(), 1, "Anonymous UNIQUE should be detected");
+        let (_name, constraint) = t.constraints.iter().next().unwrap();
+        match constraint {
+            crate::schema_model::Constraint::Unique { columns } => {
+                assert_eq!(columns.len(), 2);
+                assert!(columns.contains(&"a".to_owned()));
+                assert!(columns.contains(&"b".to_owned()));
+            }
+            _ => panic!("Expected Unique constraint"),
+        }
+    }
+
+    #[test]
+    fn multi_fk_same_table_parsed() {
+        let sql = r#"
+            CREATE TABLE a ( id integer );
+            CREATE TABLE b ( id integer );
+            CREATE TABLE c (
+              id integer,
+              a_id integer,
+              b_id integer,
+              CONSTRAINT fk_c_a FOREIGN KEY (a_id) REFERENCES a(id),
+              CONSTRAINT fk_c_b FOREIGN KEY (b_id) REFERENCES b(id)
+            );
+        "#;
+        let model = parse_schema_from_sql(sql).unwrap();
+        let c = &model.tables["c"];
+        assert_eq!(c.foreign_keys.len(), 2, "Should have 2 foreign keys");
+        assert!(c.foreign_keys.contains_key("fk_c_a"));
+        assert!(c.foreign_keys.contains_key("fk_c_b"));
+    }
+
+    #[test]
+    fn if_not_exists_table_parsed() {
+        let sql = "CREATE TABLE IF NOT EXISTS users ( id integer NOT NULL );";
+        let model = parse_schema_from_sql(sql).unwrap();
+        assert!(model.tables.contains_key("users"), "Table should be parsed despite IF NOT EXISTS");
+        assert_eq!(model.tables["users"].columns["id"].not_null, true);
+    }
+
+    #[test]
+    fn default_value_preserved() {
+        let sql = "CREATE TABLE t ( status text DEFAULT 'active', score integer DEFAULT 0 );";
+        let model = parse_schema_from_sql(sql).unwrap();
+        let t = &model.tables["t"];
+        assert_eq!(t.columns["status"].default_value.as_deref(), Some("'active'"));
+        assert_eq!(t.columns["score"].default_value.as_deref(), Some("0"));
     }
 }

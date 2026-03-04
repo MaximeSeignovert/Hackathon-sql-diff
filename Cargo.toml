@@ -2,6 +2,11 @@
 name = "hackathon_diff_sql"
 version = "0.1.0"
 edition = "2024"
+description = "Outil de diff de schemas SQL: compare deux bases de donnees (PostgreSQL, SQLite) et genere le script de migration idempotent."
+license = "MIT"
+repository = "https://github.com/votre-equipe/hackathon-diff-sql"
+keywords = ["sql", "migration", "diff", "schema", "postgres"]
+categories = ["database", "command-line-utilities"]
 
 [dependencies]
 anyhow = "1"
