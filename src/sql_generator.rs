@@ -18,8 +18,84 @@ impl From<ConnectorKind> for SqlDialect {
     }
 }
 
+/// Topological sort of table names based on FK dependencies within the set.
+/// Tables with no intra-set dependencies come first. Cycles are broken arbitrarily.
+fn topological_sort_tables<'a>(names: &'a [String], target: &SchemaModel) -> Vec<&'a String> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let name_set: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+
+    // Build adjacency: dep[A] = tables that A depends on (i.e. A has a FK → dep)
+    let mut deps: HashMap<&str, HashSet<&str>> = HashMap::new();
+    let mut rdeps: HashMap<&str, HashSet<&str>> = HashMap::new(); // reverse: who depends on me
+    let mut in_degree: HashMap<&str, usize> = HashMap::new();
+
+    for name in names {
+        deps.entry(name.as_str()).or_default();
+        rdeps.entry(name.as_str()).or_default();
+        in_degree.entry(name.as_str()).or_insert(0);
+    }
+
+    for name in names {
+        if let Some(table) = target.tables.get(name) {
+            for fk in table.foreign_keys.values() {
+                let ref_table = fk.referenced_table.as_str();
+                // Only care about deps within the set of new tables
+                if name_set.contains(ref_table) && ref_table != name.as_str() {
+                    if deps.entry(name.as_str()).or_default().insert(ref_table) {
+                        rdeps.entry(ref_table).or_default().insert(name.as_str());
+                        *in_degree.entry(name.as_str()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Kahn's algorithm
+    let mut queue: VecDeque<&str> = in_degree
+        .iter()
+        .filter(|&(_, &d)| d == 0)
+        .map(|(&n, _)| n)
+        .collect();
+    // Deterministic order within queue
+    let mut queue_vec: Vec<&str> = queue.drain(..).collect();
+    queue_vec.sort();
+    let mut queue: VecDeque<&str> = queue_vec.into_iter().collect();
+
+    let mut sorted: Vec<&str> = Vec::with_capacity(names.len());
+    while let Some(node) = queue.pop_front() {
+        sorted.push(node);
+        if let Some(dependents) = rdeps.get(node) {
+            let mut next: Vec<&str> = dependents
+                .iter()
+                .filter_map(|&dep| {
+                    let deg = in_degree.get_mut(dep)?;
+                    *deg -= 1;
+                    if *deg == 0 { Some(dep) } else { None }
+                })
+                .collect();
+            next.sort();
+            for n in next {
+                queue.push_back(n);
+            }
+        }
+    }
+
+    // Any remaining (cycle): append in original order
+    let sorted_set: HashSet<&str> = sorted.iter().copied().collect();
+    for name in names {
+        if !sorted_set.contains(name.as_str()) {
+            sorted.push(name.as_str());
+        }
+    }
+
+    // Map back to references into the original slice
+    let name_to_ref: HashMap<&str, &String> = names.iter().map(|s| (s.as_str(), s)).collect();
+    sorted.into_iter().filter_map(|s| name_to_ref.get(s).copied()).collect()
+}
+
 pub fn generate_migration_sql(
-    source: &SchemaModel,
+    _source: &SchemaModel,
     target: &SchemaModel,
     diff: &DiffResult,
     dialect: SqlDialect,
@@ -31,9 +107,10 @@ pub fn generate_migration_sql(
     out.push("-- Source -> Target".to_owned());
     out.push(String::new());
 
-    // 1) Create all new tables first so dependencies can resolve later.
-    for table_name in &diff.added_tables {
-        if let Some(table) = target.tables.get(table_name) {
+    // 1) Create all new tables in topological order (referenced tables before referencing ones).
+    let sorted_new_tables = topological_sort_tables(&diff.added_tables, target);
+    for table_name in &sorted_new_tables {
+        if let Some(table) = target.tables.get(*table_name) {
             out.push(create_table_statement(table, dialect));
         }
     }
@@ -176,17 +253,17 @@ pub fn generate_migration_sql(
     }
 
     // 3) Create indexes for newly added tables (after table creation).
-    for table_name in &diff.added_tables {
-        if let Some(table) = target.tables.get(table_name) {
+    for table_name in &sorted_new_tables {
+        if let Some(table) = target.tables.get(*table_name) {
             for index in table.indexes.values() {
                 out.push(create_index_statement(table_name, index, dialect));
             }
         }
     }
 
-    // 4) Add all foreign keys + constraints at the end (better dependency ordering).
-    for table_name in &diff.added_tables {
-        if let Some(table) = target.tables.get(table_name) {
+    // 4) Add all foreign keys at the end (better dependency ordering).
+    for table_name in &sorted_new_tables {
+        if let Some(table) = target.tables.get(*table_name) {
             for fk in table.foreign_keys.values() {
                 out.push(add_fk_statement(table_name, fk, dialect));
             }
@@ -220,7 +297,6 @@ pub fn generate_migration_sql(
         out.push("-- Aucun changement detecte".to_owned());
     }
 
-    let _ = source;
     out.join("\n")
 }
 
@@ -814,6 +890,53 @@ mod tests {
         assert!(!sql.contains("DO $$"), "SQLite FK should not use DO block");
         assert!(sql.contains("recreation de table"));
         assert!(!sql.contains("ALTER TABLE"));
+    }
+
+    #[test]
+    fn topological_sort_respects_fk_dependencies() {
+        // orders depends on users via FK — users must be created first
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "orders".to_string(),
+            Table {
+                name: "orders".to_string(),
+                columns: BTreeMap::new(),
+                indexes: BTreeMap::new(),
+                foreign_keys: [(
+                    "fk_orders_user".to_string(),
+                    ForeignKey {
+                        name: "fk_orders_user".to_string(),
+                        columns: vec!["user_id".to_string()],
+                        referenced_table: "users".to_string(),
+                        referenced_columns: vec!["id".to_string()],
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        tables.insert(
+            "users".to_string(),
+            Table {
+                name: "users".to_string(),
+                columns: BTreeMap::new(),
+                indexes: BTreeMap::new(),
+                foreign_keys: BTreeMap::new(),
+            },
+        );
+        let target = SchemaModel { tables };
+
+        // BTreeSet iteration would give ["orders", "users"] (alphabetical)
+        // topological sort must give ["users", "orders"]
+        let names = vec!["orders".to_string(), "users".to_string()];
+        let sorted = topological_sort_tables(&names, &target);
+        let sorted_names: Vec<&str> = sorted.iter().map(|s| s.as_str()).collect();
+        let users_pos = sorted_names.iter().position(|&s| s == "users").unwrap();
+        let orders_pos = sorted_names.iter().position(|&s| s == "orders").unwrap();
+        assert!(
+            users_pos < orders_pos,
+            "users (referenced) must come before orders (referencing)"
+        );
     }
 
     #[test]
